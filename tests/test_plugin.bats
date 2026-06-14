@@ -81,7 +81,9 @@ _save_ws_ids() {
   echo "output=$output"
   [ "$status" -eq 0 ]
   [ "$(echo "$output" | jq -r '.status')" = "ok" ]
-  [ "$(echo "$output" | jq -r '.created')" -ge 2 ]
+  local total
+  total=$(echo "$output" | jq -r '.created + .updated')
+  [ "$total" -ge 2 ]
   _save_ws_ids
 }
 
