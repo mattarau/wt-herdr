@@ -7,7 +7,7 @@
 
 ## How it works
 
-Each git worktree managed by `wt` becomes a herdr workspace in a **per-repo session**:
+Each git worktree managed by `wt` becomes a herdr workspace in the **`default` session**:
 
 ```
 wt list                  ──→   herdr workspace list
@@ -22,7 +22,7 @@ Workspace labels show the repo name, branch name, and status symbols from `wt li
 
 ### Sessions
 
-Every `wt herdr` subcommand auto-targets a herdr session named after the repo (e.g. `my-repo` for `repos/my-repo`). The session server starts automatically if not already running. This keeps each repo's workspaces isolated — switch between `herdr --session repo-a` and `herdr --session repo-b` to see only that repo's workspaces.
+Every `wt herdr` subcommand targets the `default` herdr session. The `default` session always runs (no server start needed). All workspaces share the same session — use labels (repo prefix) to distinguish worktrees across projects.
 
 Override with `--session <name>` or `HERDR_SESSION` env var.
 
@@ -31,15 +31,17 @@ Override with `--session <name>` or `HERDR_SESSION` env var.
 ### Manual install
 
 ```bash
-# Download the script
-curl -fsSL https://raw.githubusercontent.com/mattarau/wt-herdr/main/wt-herdr -o /usr/local/bin/wt-herdr
-chmod +x /usr/local/bin/wt-herdr
+# Download the script (use sudo if /usr/local/bin is not writable)
+sudo curl -fsSL https://raw.githubusercontent.com/mattarau/wt-herdr/main/wt-herdr -o /usr/local/bin/wt-herdr
+sudo chmod +x /usr/local/bin/wt-herdr
 ```
 
 ### One-liner
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mattarau/wt-herdr/main/install.sh | sh
+# ^ Pipe to `sudo sh` if /usr/local/bin is not writable:
+#   curl -fsSL https://raw.githubusercontent.com/mattarau/wt-herdr/main/install.sh | sudo sh
 ```
 
 ### Verify

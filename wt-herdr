@@ -20,7 +20,17 @@ IFS=$'\n\t'
 
 # ── Constants ──────────────────────────────────────────────────────────
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-PLUGIN_VERSION="0.1.0"
+
+PLUGIN_MANIFEST='{
+  "name": "herdr",
+  "executable": "wt-herdr",
+  "description": "Worktrunk ↔ herdr bridge — auto-sync git worktrees as herdr workspaces",
+  "api_versions": ["wt-custom-subcommand.v0"],
+  "version": "0.1.0",
+  "source": "https://github.com/mattarau/wt-herdr",
+  "events": ["worktree-created","worktree-removed","worktree-switched"],
+  "subcommands": ["manifest","health","sync","clean","focus","status","update-labels","event","init"]
+}'
 
 # ── Output helpers ─────────────────────────────────────────────────────
 err()    { printf '%s\n' "$*" >&2; }
@@ -34,7 +44,7 @@ version_from_manifest() {
   local line v=""
   while IFS= read -r line; do
     case "$line" in *'"version"'*) v=${line#*:}; v=${v//[\", ]/}; v=${v%,}; break;; esac
-  done < "$SELF_DIR/wt-plugin.json"
+  done <<< "$PLUGIN_MANIFEST"
   printf '%s' "$v"
 }
 
@@ -243,7 +253,7 @@ _label_repo() {
 
 # ── Subcommand: manifest ──────────────────────────────────────────────
 cmd_manifest() {
-  cat "$SELF_DIR/wt-plugin.json"
+  printf '%s\n' "$PLUGIN_MANIFEST"
 }
 
 # ── Subcommand: health ────────────────────────────────────────────────
