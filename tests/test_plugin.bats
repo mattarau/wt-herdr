@@ -23,6 +23,9 @@ setup() {
   git worktree add "$BATS_TEST_TMPDIR/wt-feature-a" feature-a 2>/dev/null || true
   git worktree add "$BATS_TEST_TMPDIR/wt-feature-b" feature-b 2>/dev/null || true
 
+  # Use default session for tests (avoids creating per-repo sessions)
+  export HERDR_SESSION=default
+
   # Record original workspace IDs so we can clean up
   export SAVED_WS_IDS=""
 }

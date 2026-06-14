@@ -7,7 +7,7 @@
 
 ## How it works
 
-Each git worktree managed by `wt` becomes a herdr workspace:
+Each git worktree managed by `wt` becomes a herdr workspace in a **per-repo session**:
 
 ```
 wt list                  ──→   herdr workspace list
@@ -19,6 +19,12 @@ wt list                  ──→   herdr workspace list
 ```
 
 Workspace labels show the repo name, branch name, and status symbols from `wt list` at a glance.
+
+### Sessions
+
+Every `wt herdr` subcommand auto-targets a herdr session named after the repo (e.g. `my-repo` for `repos/my-repo`). The session server starts automatically if not already running. This keeps each repo's workspaces isolated — switch between `herdr --session repo-a` and `herdr --session repo-b` to see only that repo's workspaces.
+
+Override with `--session <name>` or `HERDR_SESSION` env var.
 
 ## Install
 
@@ -68,7 +74,7 @@ wt herdr health
 
 | Option | Description |
 |--------|-------------|
-| `--session <name>` | Target a specific herdr session (default: current) |
+| `--session <name>` | Target a specific herdr session (default: auto-detected from repo name) |
 
 ## Setup hooks (auto-sync)
 
@@ -91,7 +97,7 @@ Once hooks are set up:
 - **`wt remove`** → automatically closes the matching herdr workspace
 - **`wt switch feature-x`** → automatically focuses the corresponding herdr workspace
 
-After the first run, you'll need to approve the project hooks:
+After the first run, you'll need to approve the repo hooks:
 
 ```
 ▲ repo needs approval to execute 1 command:
@@ -142,8 +148,10 @@ rm /usr/local/bin/wt-herdr
 # Remove hooks from your repo
 rm .config/wt.toml
 
-# Close herdr workspaces created by wt-herdr (optional)
+# Close herdr workspaces + delete the per-repo session (optional)
 wt herdr clean
+herdr session delete <repo-name>
+herdr --session <repo-name> server stop
 ```
 
 ## Development

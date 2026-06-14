@@ -107,6 +107,26 @@ herdr_ensure_ws() {
   printf '%s' "$ws_id"
 }
 
+# ── Session management ────────────────────────────────────────────────
+_ensure_session() {
+  local name="$1"
+  # Already running?
+  herdr session list --json 2>/dev/null | jq -e --arg n "$name" \
+    '.sessions[] | select(.name == $n and .running)' >/dev/null && return 0
+  # Start session server (background, auto-daemonizes)
+  herdr --session "$name" server >/dev/null 2>&1 &
+  # Poll until running (up to ~2s)
+  local i=0
+  while [[ $i -lt 10 ]]; do
+    herdr session list --json 2>/dev/null | jq -e --arg n "$name" \
+      '.sessions[] | select(.name == $n and .running)' >/dev/null && return 0
+    sleep 0.2
+    i=$((i+1))
+  done
+  err "wt-herdr: could not start session '$name'"
+  return 1
+}
+
 herdr_ws_close() {
   local ws_id="$1"
   herdr_with_session workspace close "$ws_id" >/dev/null 2>&1 || true
@@ -132,7 +152,7 @@ herdr_notify() {
   local args=()
   [[ -n "$body" ]] && args+=(--body "$body")
   [[ "$sound" != "none" ]] && args+=(--sound "$sound")
-  herdr_with_session notification show "$title" "${args[@]}" >/dev/null 2>&1 || true
+  [[ ${#args[@]} -gt 0 ]] && herdr_with_session notification show "$title" "${args[@]}" >/dev/null 2>&1 || true
 }
 
 # ── Worktrunk helpers ──────────────────────────────────────────────────
@@ -256,6 +276,8 @@ cmd_sync() {
   local repo_name
   repo_name=$(_wt_repo_name)
   [[ -n "$repo_name" ]] || die "wt-herdr: not in a git repository"
+  export HERDR_SESSION="${HERDR_SESSION:-$repo_name}"
+  _ensure_session "$HERDR_SESSION" || die "wt-herdr: could not start session '$HERDR_SESSION'"
 
   local created=0 updated=0 skipped=0 errors=0
   local results="["
@@ -337,6 +359,8 @@ cmd_clean() {
   local repo_name
   repo_name=$(_wt_repo_name)
   [[ -n "$repo_name" ]] || die "wt-herdr: not in a git repository"
+  export HERDR_SESSION="${HERDR_SESSION:-$repo_name}"
+  _ensure_session "$HERDR_SESSION" || die "wt-herdr: could not start session '$HERDR_SESSION'"
 
   # Get active worktree branches (as a JSON array for jq)
   local active_branches
@@ -399,6 +423,8 @@ cmd_focus() {
 
   local repo_name current_branch
   repo_name=$(_wt_repo_name)
+  export HERDR_SESSION="${HERDR_SESSION:-$repo_name}"
+  _ensure_session "$HERDR_SESSION" || die "wt-herdr: could not start session '$HERDR_SESSION'"
   current_branch=$(_wt_current_branch)
   [[ -n "$current_branch" ]] || die "wt-herdr: could not detect current branch"
 
@@ -435,6 +461,8 @@ cmd_status() {
   local repo_name
   repo_name=$(_wt_repo_name)
   [[ -n "$repo_name" ]] || die "wt-herdr: not in a git repository"
+  export HERDR_SESSION="${HERDR_SESSION:-$repo_name}"
+  _ensure_session "$HERDR_SESSION" || die "wt-herdr: could not start session '$HERDR_SESSION'"
 
   # Build mapping: worktree branch → herdr workspace
   local mapped=() missing_in_herdr=() missing_in_wt=()
@@ -478,18 +506,24 @@ cmd_status() {
     fi
   done <<< "$existing_labels"
 
-  # Build JSON output
+  # Build JSON output (guarded against bash3 nounset with empty arrays)
   local json_out="{\"repo\":\"$repo_name\","
   json_out+="\"worktree_count\":${#wt_branches[@]},"
   json_out+="\"mapped\":["
   local sep=""
-  for entry in "${mapped[@]}"; do json_out+="$sep$entry"; sep=","; done
+  if [[ ${#mapped[@]} -gt 0 ]]; then
+    for entry in "${mapped[@]}"; do json_out+="$sep$entry"; sep=","; done
+  fi
   json_out+="],\"missing_in_herdr\":["
   sep=""
-  for entry in "${missing_in_herdr[@]}"; do json_out+="$sep$entry"; sep=","; done
+  if [[ ${#missing_in_herdr[@]} -gt 0 ]]; then
+    for entry in "${missing_in_herdr[@]}"; do json_out+="$sep$entry"; sep=","; done
+  fi
   json_out+="],\"orphan_workspaces\":["
   sep=""
-  for entry in "${missing_in_wt[@]}"; do json_out+="$sep$entry"; sep=","; done
+  if [[ ${#missing_in_wt[@]} -gt 0 ]]; then
+    for entry in "${missing_in_wt[@]}"; do json_out+="$sep$entry"; sep=","; done
+  fi
   json_out+="]}"
 
   json "$json_out"
@@ -514,6 +548,8 @@ cmd_update_labels() {
   local repo_name
   repo_name=$(_wt_repo_name)
   [[ -n "$repo_name" ]] || die "wt-herdr: not in a git repository"
+  export HERDR_SESSION="${HERDR_SESSION:-$repo_name}"
+  _ensure_session "$HERDR_SESSION" || die "wt-herdr: could not start session '$HERDR_SESSION'"
 
   local updated=0 skipped=0 errors=0
 
@@ -571,6 +607,8 @@ cmd_event() {
   [[ -n "$branch" ]] || branch=$(_wt_current_branch)
   [[ -n "$path" ]]   || path=$(_wt_worktree_for_branch "$branch")
   repo_name=$(_wt_repo_name)
+  export HERDR_SESSION="${HERDR_SESSION:-$repo_name}"
+  _ensure_session "$HERDR_SESSION" || die "wt-herdr: could not start session '$HERDR_SESSION'"
 
   [[ -n "$branch" ]]    || die "wt-herdr event: could not determine branch"
   [[ -n "$repo_name" ]] || die "wt-herdr event: could not determine repo"
@@ -743,7 +781,7 @@ SUBCOMMANDS:
   init             Set up hooks config + initial sync
 
 GLOBAL OPTIONS:
-  --session <name>  Target a specific herdr session (default: current)
+  --session <name>  Target a specific herdr session (default: auto-detected from repo name)
 
 EXAMPLES:
   wt herdr sync                    # Sync all worktrees
