@@ -1,0 +1,766 @@
+#!/usr/bin/env bash
+# wt-herdr — worktrunk ↔ herdr bridge
+#
+# Callable as `wt herdr <subcommand>` when `wt-herdr` is on PATH.
+# Implements the worktrunk custom subcommand pattern.
+#
+# Subcommands:
+#   manifest       Print plugin manifest JSON
+#   health         Check dependencies (herdr, herdr server, jq, wt)
+#   sync           Sync all worktrees as herdr workspaces
+#   clean          Close herdr workspaces for deleted worktrees
+#   focus          Focus herdr workspace for current worktree
+#   status         Show mapping between worktrees and herdr workspaces
+#   update-labels  Refresh status badges in workspace labels
+#   event          Handle lifecycle events (called from hooks)
+#   init           Set up hooks config + initial sync
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ── Constants ──────────────────────────────────────────────────────────
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_VERSION="0.1.0"
+
+# ── Output helpers ─────────────────────────────────────────────────────
+err()    { printf '%s\n' "$*" >&2; }
+die()    { err "$*"; exit 1; }
+json()   { printf '%s\n' "$*"; }
+json_o() { json '{'"$1"'}'; }
+json_kv(){ json '"'"$1"'": "'"$2"'",'; }
+
+have()   { command -v "$1" >/dev/null 2>&1; }
+version_from_manifest() {
+  local line v=""
+  while IFS= read -r line; do
+    case "$line" in *'"version"'*) v=${line#*:}; v=${v//[\", ]/}; v=${v%,}; break;; esac
+  done < "$SELF_DIR/wt-plugin.json"
+  printf '%s' "$v"
+}
+
+# ── Session handling ───────────────────────────────────────────────────
+# HERDR_SESSION is set by main() from `--session <name>` or inherited from env.
+# All herdr calls should use _session_prefix before the subcommand.
+_session_prefix() {
+  local s="${HERDR_SESSION:+}"
+  if [[ -n "$s" ]]; then printf '--session %q ' "$s"; fi
+}
+
+# Run herdr with the active session
+herdr_with_session() {
+  # shellcheck disable=SC2086
+  herdr $(_session_prefix) "$@"
+}
+
+# ── herdr helpers ──────────────────────────────────────────────────────
+herdr_server_up() {
+  local _out
+  _out=$(herdr status server 2>/dev/null) || true
+  case "$_out" in
+    *"status: running"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+herdr_workspace_list() {
+  # Direct pipe approach — capture stdout only, fallback on failure
+  herdr_with_session workspace list 2>/dev/null || echo '{"result":{"workspaces":[]}}'
+}
+
+herdr_ws_by_label() {
+  local label="$1"
+  herdr_workspace_list \
+    | jq -r --arg label "$label" \
+      '.result.workspaces[] | select(.label == $label) | .workspace_id' \
+    | head -1
+}
+
+herdr_ws_find_by_branch() {
+  local repo="$1" branch="$2"
+  # Try exact label match first
+  local exact_label="$repo / $branch"
+  local ws_id
+  ws_id=$(herdr_ws_by_label "$exact_label")
+  if [[ -n "$ws_id" ]]; then
+    printf '%s' "$ws_id"
+    return 0
+  fi
+
+  # Try matching just the label prefix (branch may have gained/lost symbols)
+  # NOTE: parentheses around the `or` groups are REQUIRED because jq's `|`
+  # binds tighter than `or`. Without them, `.label` is piped into the entire
+  # `or` expression and the second `.label` tries to index a string.
+  herdr_workspace_list \
+    | jq -r --arg repo "$repo" --arg branch "$branch" \
+      '.result.workspaces[] | select((.label | startswith($repo + " / " + $branch + "  ")) or (.label == ($repo + " / " + $branch))) | .workspace_id' \
+    | head -1
+}
+
+herdr_ensure_ws() {
+  local label="$1" cwd="$2" ws_id
+  ws_id=$(herdr_ws_by_label "$label")
+  if [[ -z "$ws_id" ]]; then
+    herdr_with_session workspace create --label "$label" --cwd "$cwd" --no-focus >/dev/null 2>&1 || return 1
+    ws_id=$(herdr_ws_by_label "$label")
+  fi
+  [[ -n "$ws_id" ]] || return 1
+  printf '%s' "$ws_id"
+}
+
+herdr_ws_close() {
+  local ws_id="$1"
+  herdr_with_session workspace close "$ws_id" >/dev/null 2>&1 || true
+}
+
+herdr_ws_focus() {
+  local ws_id="$1"
+  herdr_with_session workspace focus "$ws_id" >/dev/null 2>&1 || true
+}
+
+herdr_ws_rename() {
+  local ws_id="$1" new_label="$2"
+  herdr_with_session workspace rename "$ws_id" "$new_label" >/dev/null 2>&1 || true
+}
+
+herdr_tab_create() {
+  local ws_id="$1" cwd="$2" label="$3"
+  herdr_with_session tab create --workspace "$ws_id" --cwd "$cwd" --label "$label" --focus >/dev/null 2>&1 || true
+}
+
+herdr_notify() {
+  local title="$1" body="${2:-}" sound="${3:-none}"
+  local args=()
+  [[ -n "$body" ]] && args+=(--body "$body")
+  [[ "$sound" != "none" ]] && args+=(--sound "$sound")
+  herdr_with_session notification show "$title" "${args[@]}" >/dev/null 2>&1 || true
+}
+
+# ── Worktrunk helpers ──────────────────────────────────────────────────
+_wt_list() {
+  wt list --format=json 2>/dev/null || echo '[]'
+}
+
+_wt_worktrees() {
+  _wt_list | jq -c '.[] | select(.kind == "worktree")'
+}
+
+_wt_current_branch() {
+  _wt_list | jq -r '.[] | select(.is_current) | .branch // empty' | head -1
+}
+
+_wt_repo_name() {
+  local name
+  name=$(git rev-parse --show-toplevel 2>/dev/null | xargs basename 2>/dev/null || true)
+  if [[ -z "$name" ]]; then
+    name=$(basename "$(git remote get-url origin 2>/dev/null)" .git 2>/dev/null || echo "repo")
+  fi
+  printf '%s' "$name"
+}
+
+_wt_worktree_for_branch() {
+  local branch="$1"
+  _wt_list | jq -r --arg branch "$branch" '.[] | select(.branch == $branch and .kind == "worktree") | .path // empty' | head -1
+}
+
+_wt_symbols() {
+  local branch="$1"
+  _wt_list | jq -r --arg branch "$branch" '.[] | select(.branch == $branch) | .symbols // empty' | head -1
+}
+
+# Build workspace label: "{repo} / {branch}  {symbols}"
+_make_label() {
+  local repo="$1" branch="$2" symbols="$3"
+  if [[ -n "$symbols" ]]; then
+    printf '%s / %s  %s' "$repo" "$branch" "$symbols"
+  else
+    printf '%s / %s' "$repo" "$branch"
+  fi
+}
+
+# Extract branch name from a label that may have symbols
+_label_branch() {
+  local label="$1"
+  local stripped="${label#* / }"
+  case "$stripped" in
+    *'  '*) printf '%s' "${stripped%%  *}" ;;
+    *)      printf '%s' "$stripped" ;;
+  esac
+}
+
+# Extract repo name from a label
+_label_repo() {
+  local label="$1"
+  printf '%s' "${label%% / *}"
+}
+
+# ── Subcommand: manifest ──────────────────────────────────────────────
+cmd_manifest() {
+  cat "$SELF_DIR/wt-plugin.json"
+}
+
+# ── Subcommand: health ────────────────────────────────────────────────
+cmd_health() {
+  local v herdr_bin jq_bin wt_bin
+  local ha=false sr=false ja=false wa=false
+
+  v=$(version_from_manifest)
+  herdr_bin=$(command -v herdr 2>/dev/null || true)
+  jq_bin=$(command -v jq 2>/dev/null || true)
+  wt_bin=$(command -v wt 2>/dev/null || true)
+
+  [[ -n "$herdr_bin" ]] && ha=true
+  [[ -n "$jq_bin" ]] && ja=true
+  [[ -n "$wt_bin" ]] && wa=true
+
+  if $ha; then herdr_server_up 2>/dev/null && sr=true; fi
+
+  local ok=true reason="null"
+  if ! $ha; then ok=false; reason="\"herdr not installed\""
+  elif ! $sr; then ok=false; reason="\"herdr server not running\""
+  fi
+  if ! $ja; then ok=false; reason="\"jq not installed\""
+  fi
+  if ! $wa; then ok=false; reason="\"wt (worktrunk) not installed\""
+  fi
+
+  json "{
+  \"ok\": $ok,
+  \"version\": \"$v\",
+  \"reason\": $reason,
+  \"herdr\": \"$herdr_bin\",
+  \"herdr_available\": $ha,
+  \"server_running\": $sr,
+  \"jq\": \"$jq_bin\",
+  \"jq_available\": $ja,
+  \"wt\": \"$wt_bin\",
+  \"wt_available\": $wa
+}"
+  $ok || exit 30
+}
+
+# ── Subcommand: sync ─────────────────────────────────────────────────
+cmd_sync() {
+  local dry_run=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true ;;
+      *) err "wt-herdr sync: unknown option '$1'"; exit 2 ;;
+    esac
+    shift
+  done
+
+  have herdr || die "wt-herdr: herdr not installed"
+  have jq    || die "wt-herdr: jq not installed"
+  have wt    || die "wt-herdr: wt (worktrunk) not installed"
+
+  local repo_name
+  repo_name=$(_wt_repo_name)
+  [[ -n "$repo_name" ]] || die "wt-herdr: not in a git repository"
+
+  local created=0 updated=0 skipped=0 errors=0
+  local results="["
+
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] || continue
+    local branch path symbols label ws_id
+    branch=$(echo "$wt" | jq -r '.branch // "detached"')
+    path=$(echo "$wt" | jq -r '.path // ""')
+    symbols=$(echo "$wt" | jq -r '.symbols // ""')
+    is_current=$(echo "$wt" | jq -r '.is_current // false')
+
+    [[ -n "$path" ]] || { errors=$((errors+1)); continue; }
+
+    label=$(_make_label "$repo_name" "$branch" "$symbols")
+
+    if $dry_run; then
+      printf '{"branch":"%s","action":"would-create","label":"%s","path":"%s","is_current":%s}\n' \
+        "$branch" "$label" "$path" "$is_current"
+      skipped=$((skipped+1))
+      continue
+    fi
+
+    # Check if workspace already exists (by branch, accounting for label changes)
+    ws_id=$(herdr_ws_find_by_branch "$repo_name" "$branch")
+    if [[ -z "$ws_id" ]]; then
+      # Create new workspace
+      ws_id=$(herdr_ensure_ws "$label" "$path") || {
+        errors=$((errors+1))
+        continue
+      }
+      # Create an initial tab for the workspace
+      herdr_tab_create "$ws_id" "$path" "$branch"
+      created=$((created+1))
+    else
+      # Workspace exists — update label with current symbols
+      local current_label
+      current_label=$(herdr_workspace_list | jq -r --arg wid "$ws_id" '.result.workspaces[] | select(.workspace_id == $wid) | .label // ""' | head -1)
+      if [[ "$current_label" != "$label" ]]; then
+        herdr_ws_rename "$ws_id" "$label"
+        updated=$((updated+1))
+      else
+        skipped=$((skipped+1))
+      fi
+    fi
+  done <<< "$(_wt_worktrees)"
+
+  # Remove trailing comma and close array
+  results="${results%,}]"
+
+  # Build final response
+  json "{
+  \"status\": \"ok\",
+  \"repo\": \"$repo_name\",
+  \"created\": $created,
+  \"updated\": $updated,
+  \"skipped\": $skipped,
+  \"errors\": $errors
+}"
+  herdr_notify "wt-herdr: sync complete" "$created created, $updated updated, $skipped unchanged" "done"
+}
+
+# ── Subcommand: clean ─────────────────────────────────────────────────
+cmd_clean() {
+  local dry_run=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true ;;
+      *) err "wt-herdr clean: unknown option '$1'"; exit 2 ;;
+    esac
+    shift
+  done
+
+  have herdr || die "wt-herdr: herdr not installed"
+  have jq    || die "wt-herdr: jq not installed"
+  have wt    || die "wt-herdr: wt (worktrunk) not installed"
+  herdr_server_up || die "wt-herdr: herdr server not running"
+
+  local repo_name
+  repo_name=$(_wt_repo_name)
+  [[ -n "$repo_name" ]] || die "wt-herdr: not in a git repository"
+
+  # Get active worktree branches (as a JSON array for jq)
+  local active_branches
+  active_branches=$(_wt_list | jq -c '[.[] | select(.kind == "worktree") | .branch]')
+
+  local closed=0 errors=0
+
+  # Find all herdr workspaces whose label matches our "{repo} / {branch}  {symbols}" pattern
+  while IFS= read -r ws; do
+    [[ -n "$ws" ]] || continue
+    local ws_id ws_label ws_branch
+    ws_id=$(echo "$ws" | jq -r '.workspace_id')
+    ws_label=$(echo "$ws" | jq -r '.label // ""')
+    [[ -n "$ws_label" ]] || continue
+
+    # Only consider workspaces with our "{repo} / {branch}" format (must contain " / ")
+    case "$ws_label" in
+      *" / "*) ;;  # has the separator
+      *) continue ;;  # skip workspaces not created by wt-herdr
+    esac
+
+    # Must match our repo
+    local label_repo
+    label_repo=$(_label_repo "$ws_label")
+    [[ "$label_repo" == "$repo_name" ]] || continue
+
+    ws_branch=$(_label_branch "$ws_label")
+    [[ -n "$ws_branch" ]] || continue
+
+    # Check if this branch exists as a worktree
+    local found
+    found=$(echo "$active_branches" | jq -r --arg b "$ws_branch" 'contains([$b])')
+    if [[ "$found" != "true" ]]; then
+      if $dry_run; then
+        echo "Would close workspace: $ws_label ($ws_id)"
+        closed=$((closed+1))
+      else
+        herdr_ws_close "$ws_id" && closed=$((closed+1)) || errors=$((errors+1))
+      fi
+    fi
+  done <<< "$(herdr_workspace_list | jq -c '.result.workspaces[]')"
+
+  json "{
+  \"status\": \"ok\",
+  \"repo\": \"$repo_name\",
+  \"closed\": $closed,
+  \"errors\": $errors
+}"
+  if [[ "$closed" -gt 0 ]]; then
+    herdr_notify "wt-herdr: clean complete" "Closed $closed workspaces" "none"
+  fi
+}
+
+# ── Subcommand: focus ─────────────────────────────────────────────────
+cmd_focus() {
+  have herdr || die "wt-herdr: herdr not installed"
+  have jq    || die "wt-herdr: jq not installed"
+  have wt    || die "wt-herdr: wt (worktrunk) not installed"
+  herdr_server_up || die "wt-herdr: herdr server not running"
+
+  local repo_name current_branch
+  repo_name=$(_wt_repo_name)
+  current_branch=$(_wt_current_branch)
+  [[ -n "$current_branch" ]] || die "wt-herdr: could not detect current branch"
+
+  local ws_id
+  ws_id=$(herdr_ws_find_by_branch "$repo_name" "$current_branch")
+  if [[ -z "$ws_id" ]]; then
+    # Maybe not synced yet — try creating on the fly
+    local path symbols label
+    path=$(_wt_worktree_for_branch "$current_branch")
+    symbols=$(_wt_symbols "$current_branch")
+    label=$(_make_label "$repo_name" "$current_branch" "$symbols")
+
+    ws_id=$(herdr_ensure_ws "$label" "$path") || die "wt-herdr: could not create workspace for '$current_branch'"
+    herdr_tab_create "$ws_id" "$path" "$current_branch"
+  fi
+
+  herdr_ws_focus "$ws_id"
+
+  json "{
+  \"status\": \"ok\",
+  \"branch\": \"$current_branch\",
+  \"workspace_id\": \"$ws_id\"
+}"
+  herdr_notify "wt-herdr: focus" "$current_branch" "none"
+}
+
+# ── Subcommand: status ────────────────────────────────────────────────
+cmd_status() {
+  have herdr || die "wt-herdr: herdr not installed"
+  have jq    || die "wt-herdr: jq not installed"
+  have wt    || die "wt-herdr: wt (worktrunk) not installed"
+  herdr_server_up || die "wt-herdr: herdr server not running"
+
+  local repo_name
+  repo_name=$(_wt_repo_name)
+  [[ -n "$repo_name" ]] || die "wt-herdr: not in a git repository"
+
+  # Build mapping: worktree branch → herdr workspace
+  local mapped=() missing_in_herdr=() missing_in_wt=()
+
+  # Collect all worktree branches
+  local wt_branches=()
+  while IFS= read -r b; do
+    [[ -n "$b" ]] && wt_branches+=("$b")
+  done <<< "$(_wt_list | jq -r '.[] | select(.kind == "worktree") | .branch')"
+
+  # For each worktree branch, find its herdr workspace
+  local b
+  for b in "${wt_branches[@]}"; do
+    local ws_id ws_label
+    ws_id=$(herdr_ws_find_by_branch "$repo_name" "$b")
+    if [[ -n "$ws_id" ]]; then
+      ws_label=$(herdr_workspace_list | jq -r --arg wid "$ws_id" '.result.workspaces[] | select(.workspace_id == $wid) | .label // ""' | head -1)
+      mapped+=("{\"branch\":\"$b\",\"workspace_id\":\"$ws_id\",\"label\":\"$ws_label\",\"status\":\"mapped\"}")
+    else
+      missing_in_herdr+=("{\"branch\":\"$b\",\"status\":\"missing_in_herdr\"}")
+    fi
+  done
+
+  # Find herdr workspaces that don't have a corresponding worktree
+  local existing_labels
+  existing_labels=$(herdr_workspace_list | jq -r '.result.workspaces[].label // empty')
+  while IFS= read -r lbl; do
+    [[ -n "$lbl" ]] || continue
+    local lr lb
+    lr=$(_label_repo "$lbl")
+    [[ "$lr" == "$repo_name" ]] || continue
+    lb=$(_label_branch "$lbl")
+    local found=false
+    for b in "${wt_branches[@]}"; do
+      [[ "$b" == "$lb" ]] && { found=true; break; }
+    done
+    if ! $found; then
+      local wid
+      wid=$(herdr_ws_by_label "$lbl")
+      missing_in_wt+=("{\"branch\":\"$lb\",\"workspace_id\":\"$wid\",\"label\":\"$lbl\",\"status\":\"orphan\"}")
+    fi
+  done <<< "$existing_labels"
+
+  # Build JSON output
+  local json_out="{\"repo\":\"$repo_name\","
+  json_out+="\"worktree_count\":${#wt_branches[@]},"
+  json_out+="\"mapped\":["
+  local sep=""
+  for entry in "${mapped[@]}"; do json_out+="$sep$entry"; sep=","; done
+  json_out+="],\"missing_in_herdr\":["
+  sep=""
+  for entry in "${missing_in_herdr[@]}"; do json_out+="$sep$entry"; sep=","; done
+  json_out+="],\"orphan_workspaces\":["
+  sep=""
+  for entry in "${missing_in_wt[@]}"; do json_out+="$sep$entry"; sep=","; done
+  json_out+="]}"
+
+  json "$json_out"
+}
+
+# ── Subcommand: update-labels ─────────────────────────────────────────
+cmd_update_labels() {
+  local dry_run=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true ;;
+      *) err "wt-herdr update-labels: unknown option '$1'"; exit 2 ;;
+    esac
+    shift
+  done
+
+  have herdr || die "wt-herdr: herdr not installed"
+  have jq    || die "wt-herdr: jq not installed"
+  have wt    || die "wt-herdr: wt (worktrunk) not installed"
+  herdr_server_up || die "wt-herdr: herdr server not running"
+
+  local repo_name
+  repo_name=$(_wt_repo_name)
+  [[ -n "$repo_name" ]] || die "wt-herdr: not in a git repository"
+
+  local updated=0 skipped=0 errors=0
+
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] || continue
+    local branch path symbols label ws_id current_label
+    branch=$(echo "$wt" | jq -r '.branch // "detached"')
+    path=$(echo "$wt" | jq -r '.path // ""')
+    symbols=$(echo "$wt" | jq -r '.symbols // ""')
+
+    label=$(_make_label "$repo_name" "$branch" "$symbols")
+    ws_id=$(herdr_ws_find_by_branch "$repo_name" "$branch")
+    [[ -z "$ws_id" ]] && { skipped=$((skipped+1)); continue; }
+
+    current_label=$(herdr_workspace_list | jq -r --arg wid "$ws_id" '.result.workspaces[] | select(.workspace_id == $wid) | .label // ""' | head -1)
+    if [[ "$current_label" != "$label" ]]; then
+      if $dry_run; then
+        skipped=$((skipped+1))
+      else
+        herdr_ws_rename "$ws_id" "$label" && updated=$((updated+1)) || errors=$((errors+1))
+      fi
+    else
+      skipped=$((skipped+1))
+    fi
+  done <<< "$(_wt_worktrees)"
+
+  json "{
+  \"status\": \"ok\",
+  \"repo\": \"$repo_name\",
+  \"updated\": $updated,
+  \"skipped\": $skipped,
+  \"errors\": $errors
+}"
+}
+
+# ── Subcommand: event (lifecycle handler for hooks) ───────────────────
+cmd_event() {
+  local event_type="${1:-}"
+  [[ -n "$event_type" ]] || die "wt-herdr event: usage: event <type>"
+
+  have herdr || die "wt-herdr: herdr not installed"
+  have jq    || die "wt-herdr: jq not installed"
+  have wt    || die "wt-herdr: wt (worktrunk) not installed"
+
+  # Read JSON context from stdin (worktrunk hooks pass template variables as JSON)
+  local ctx
+  ctx=$(cat)
+
+  # Extract context variables (falling back to runtime detection)
+  local branch path repo_name
+  branch=$(echo "$ctx" | jq -r '.branch // empty' 2>/dev/null)
+  path=$(echo "$ctx" | jq -r '.worktree_path // empty' 2>/dev/null)
+
+  # If context is missing fields, fall back to current state
+  [[ -n "$branch" ]] || branch=$(_wt_current_branch)
+  [[ -n "$path" ]]   || path=$(_wt_worktree_for_branch "$branch")
+  repo_name=$(_wt_repo_name)
+
+  [[ -n "$branch" ]]    || die "wt-herdr event: could not determine branch"
+  [[ -n "$repo_name" ]] || die "wt-herdr event: could not determine repo"
+
+  case "$event_type" in
+    worktree-created)
+      local symbols label ws_id
+      symbols=$(_wt_symbols "$branch")
+      label=$(_make_label "$repo_name" "$branch" "$symbols")
+      ws_id=$(herdr_ws_find_by_branch "$repo_name" "$branch")
+      if [[ -z "$ws_id" ]]; then
+        ws_id=$(herdr_ensure_ws "$label" "$path") || die "wt-herdr event: could not create workspace for '$branch'"
+        herdr_tab_create "$ws_id" "$path" "$branch"
+        herdr_notify "wt-herdr: created" "$branch" "done"
+        json "{\"status\":\"ok\",\"action\":\"created\",\"branch\":\"$branch\",\"workspace_id\":\"$ws_id\"}"
+      else
+        json "{\"status\":\"ok\",\"action\":\"already_exists\",\"branch\":\"$branch\",\"workspace_id\":\"$ws_id\"}"
+      fi
+      ;;
+
+    worktree-removed)
+      local ws_id
+      ws_id=$(herdr_ws_find_by_branch "$repo_name" "$branch")
+      if [[ -n "$ws_id" ]]; then
+        herdr_ws_close "$ws_id"
+        herdr_notify "wt-herdr: removed" "$branch" "none"
+        json "{\"status\":\"ok\",\"action\":\"closed\",\"branch\":\"$branch\",\"workspace_id\":\"$ws_id\"}"
+      else
+        json "{\"status\":\"noop\",\"action\":\"not_found\",\"branch\":\"$branch\"}"
+      fi
+      ;;
+
+    worktree-switched)
+      local ws_id symbols label
+      symbols=$(_wt_symbols "$branch")
+      label=$(_make_label "$repo_name" "$branch" "$symbols")
+      ws_id=$(herdr_ws_find_by_branch "$repo_name" "$branch")
+      if [[ -n "$ws_id" ]]; then
+        herdr_ws_rename "$ws_id" "$label"
+        herdr_ws_focus "$ws_id"
+        json "{\"status\":\"ok\",\"action\":\"focused\",\"branch\":\"$branch\",\"workspace_id\":\"$ws_id\"}"
+      else
+        # Not yet synced — create on the fly
+        ws_id=$(herdr_ensure_ws "$label" "$path") || die "wt-herdr event: could not create workspace for '$branch'"
+        herdr_tab_create "$ws_id" "$path" "$branch"
+        herdr_ws_focus "$ws_id"
+        herdr_notify "wt-herdr: created & focused" "$branch" "done"
+        json "{\"status\":\"ok\",\"action\":\"created_and_focused\",\"branch\":\"$branch\",\"workspace_id\":\"$ws_id\"}"
+      fi
+      ;;
+
+    *)
+      die "wt-herdr event: unknown event type '$event_type' (valid: worktree-created, worktree-removed, worktree-switched)"
+      ;;
+  esac
+}
+
+# ── Subcommand: init ─────────────────────────────────────────────────
+cmd_init() {
+  have herdr || die "wt-herdr: herdr not installed"
+  have jq    || die "wt-herdr: jq not installed"
+  have wt    || die "wt-herdr: wt (worktrunk) not installed"
+
+  local repo_root
+  repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || die "wt-herdr init: not in a git repository"
+
+  local config_dir="$repo_root/.config"
+  local config_file="$config_dir/wt.toml"
+
+  if [[ -f "$config_file" ]]; then
+    err "wt-herdr init: $config_file already exists"
+    err "Back it up or remove it first, or add hooks manually (see README)."
+    exit 1
+  fi
+
+  mkdir -p "$config_dir"
+
+  cat > "$config_file" << 'TOML'
+# Worktrunk hooks — auto-sync worktrees with herdr workspaces
+# Generated by `wt herdr init`
+# See: https://github.com/mattarau/wt-herdr
+
+# On new worktree creation: create a herdr workspace
+[post-start]
+herdr = "wt herdr event worktree-created"
+
+# On worktree removal: close the matching herdr workspace
+[post-remove]
+herdr = "wt herdr event worktree-removed"
+
+# On worktree switch: focus the matching herdr workspace
+[post-switch]
+herdr = "wt herdr event worktree-switched"
+TOML
+
+  echo "Created $config_file"
+
+  # Also try to link wt-herdr into PATH if not already there
+  if ! have wt-herdr; then
+    local install_dir="${INSTALL_DIR:-/usr/local/bin}"
+    if [[ -d "$install_dir" ]]; then
+      local symlink_target="$install_dir/wt-herdr"
+      if [[ ! -f "$symlink_target" ]]; then
+        if ln -sf "$SELF_DIR/wt-herdr" "$symlink_target" 2>/dev/null; then
+          echo "Linked $symlink_target → $SELF_DIR/wt-herdr"
+        else
+          err "Warning: could not symlink to $install_dir (permission denied)"
+          err "Add $SELF_DIR to your PATH or run: sudo ln -sf $SELF_DIR/wt-herdr $install_dir/"
+        fi
+      fi
+    fi
+  fi
+
+  # Approve the hooks so they run without prompting
+  echo "Setting up hooks... (may prompt for approval)"
+  wt hook pre-start --yes 2>/dev/null || true
+  wt hook post-start --yes 2>/dev/null || true
+  wt hook pre-remove --yes 2>/dev/null || true
+  wt hook post-remove --yes 2>/dev/null || true
+  wt hook pre-switch --yes 2>/dev/null || true
+  wt hook post-switch --yes 2>/dev/null || true
+
+  # Run initial sync
+  echo "Running initial sync..."
+  cmd_sync
+}
+
+# ── Main dispatch ─────────────────────────────────────────────────────
+main() {
+  # Support --session flag before subcommand
+  # IMPORTANT: never export HERDR_SESSION as empty string — herdr rejects it.
+  local session="${HERDR_SESSION:-}"
+  while [[ $# -gt 0 ]] && [[ "$1" == --session ]]; do
+    session="$2"
+    shift 2
+  done
+  if [[ -n "$session" ]]; then
+    export HERDR_SESSION="$session"
+  else
+    unset HERDR_SESSION
+  fi
+
+  case "${1:-}" in
+    manifest)      cmd_manifest ;;
+    health)        cmd_health ;;
+    sync)          shift; cmd_sync "$@" ;;
+    clean)         shift; cmd_clean "$@" ;;
+    focus)         cmd_focus ;;
+    status)        cmd_status ;;
+    update-labels) shift; cmd_update_labels "$@" ;;
+    event)         shift; cmd_event "$@" ;;
+    init)          cmd_init ;;
+    -h|--help|help|"")
+      cat <<'HELP'
+wt-herdr — worktrunk ↔ herdr bridge
+
+USAGE:
+  wt herdr <subcommand> [options]
+
+SUBCOMMANDS:
+  manifest         Print plugin manifest JSON
+  health           Check dependencies (herdr, jq, wt) and server status
+  sync [--dry-run] Sync all worktrees as herdr workspaces
+  clean [--dry-run] Close herdr workspaces for deleted worktrees
+  focus            Focus herdr workspace for current worktree
+  status           Show mapping between worktrees and herdr workspaces
+  update-labels [--dry-run]  Refresh status badges in workspace labels
+  event <type>     Handle lifecycle event (read JSON context from stdin)
+                   Types: worktree-created, worktree-removed, worktree-switched
+  init             Set up hooks config + initial sync
+
+GLOBAL OPTIONS:
+  --session <name>  Target a specific herdr session (default: current)
+
+EXAMPLES:
+  wt herdr sync                    # Sync all worktrees
+  wt herdr sync --dry-run          # Preview without changes
+  wt herdr clean --dry-run         # Preview cleanup
+  wt herdr focus                   # Focus current workspace
+  wt herdr status                  # Show sync mapping
+  wt herdr --session work sync     # Target a specific session
+  wt herdr init                    # Set up hooks + sync
+
+SOURCE: https://github.com/mattarau/wt-herdr
+HELP
+      ;;
+    *)
+      die "wt-herdr: unknown subcommand '$1'. Run 'wt herdr help' for usage."
+      ;;
+  esac
+}
+
+main "$@"

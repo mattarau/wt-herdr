@@ -1,0 +1,24 @@
+{
+  "name": "herdr",
+  "executable": "wt-herdr",
+  "description": "Worktrunk ↔ herdr bridge — auto-sync git worktrees as herdr workspaces",
+  "api_versions": ["wt-custom-subcommand.v0"],
+  "version": "0.1.0",
+  "source": "https://github.com/mattarau/wt-herdr",
+  "events": [
+    "worktree-created",
+    "worktree-removed",
+    "worktree-switched"
+  ],
+  "subcommands": [
+    "manifest",
+    "health",
+    "sync",
+    "clean",
+    "focus",
+    "status",
+    "update-labels",
+    "event",
+    "init"
+  ]
+}
